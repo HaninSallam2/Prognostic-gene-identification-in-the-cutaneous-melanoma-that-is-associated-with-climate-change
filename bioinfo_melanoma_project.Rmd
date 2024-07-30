@@ -1,0 +1,308 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+library(TCGAbiolinks)
+library(dplyr)
+library(readxl)
+library(biomaRt)
+library(SummarizedExperiment)
+library(readr)
+library(sesame)
+library(DESeq2)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(minfi)
+library(minfiData)
+library(limma)
+?preprocessQuantile()
+```
+
+
+
+
+```{r}
+#downloading methylation data
+meth_query <- GDCquery(project = "TCGA-SKCM",
+                              data.category = "DNA Methylation",
+                              data.type = "Methylation Beta Value",
+                              platform = "Illumina Human Methylation 450",
+                              sample.type = c("Primary Tumor"))
+methylation <- GDCprepare(meth_query)
+methylation <- assay(methylation)
+methylation <- na.omit(methylation)
+#transform beta values to M values 
+methylation <- logit2(methylation)
+```
+
+
+
+```{r}
+#remove "-" extra identification of the samples to download the samples that have methylation data
+
+delim_fn = function(x, n, i){
+  do.call(c, lapply(x, function(X)
+    paste(unlist(strsplit(X, "-"))[(n+1):(i)], collapse = "-")))
+}
+
+colnames(methylation)= delim_fn(x = colnames(methylation), n = 0, i = 3)
+
+```
+
+
+```{r}
+#read the downloaded clinical data file
+SKCM_clinical <- read_tsv("clinical.project-tcga-skcm.2024-05-07/clinical.tsv")
+SKCM_clinical <- SKCM_clinical[!duplicated(SKCM_clinical$case_submitter_id), ]
+SKCM_clinical <- SKCM_clinical[SKCM_clinical$case_submitter_id %in% colnames(methylation), ]
+
+```
+
+
+```{r}
+#assiging the values of the year of dignosis as integers and get the mean value
+SKCM_clinical <- SKCM_clinical[!(SKCM_clinical$year_of_diagnosis=="'--"), ]
+
+SKCM_clinical$year_of_diagnosis <- as.integer(SKCM_clinical$year_of_diagnosis)
+mean <-as.integer(mean(SKCM_clinical$year_of_diagnosis))
+```
+
+
+```{r}
+#remove the samples that is +\- 3 of the mean value 
+high <- mean +1
+low <- mean -1
+
+SKCM_low <- SKCM_clinical[SKCM_clinical$year_of_diagnosis < low ,]
+SKCM_high <- SKCM_clinical [SKCM_clinical$year_of_diagnosis > high,]
+```
+
+
+```{r}
+#add climate coumn as factor to the clinical data
+SKCM_low$Climate <- as.factor("Low")
+SKCM_high$Climate <- as.factor("High")
+SKCM_clinical<- rbind(SKCM_high, SKCM_low)
+```
+
+
+
+
+```{r}
+#downloading mrna data
+mrna_query <- GDCquery(project = "TCGA-SKCM",
+                       data.category = "Transcriptome Profiling",
+                       data.type = "Gene Expression Quantification",
+                       workflow.type = "STAR - Counts",
+                       experimental.strategy = "RNA-Seq",
+                       sample.type = c("Primary Tumor"),
+                       barcode = SKCM_clinical$case_submitter_id)
+GDCdownload(mrna_query)
+mrna_df <- GDCprepare(mrna_query)
+mrna <- assay(mrna_df)
+colnames(mrna)= delim_fn(x = colnames(mrna), n = 0, i = 3)
+
+```
+
+
+```{r}
+removeVersion <- function(ids){
+  return(unlist(lapply(stringr::str_split(ids, "[.]"), "[[",1)))
+}
+
+mrna_df=mrna[!duplicated(removeVersion(rownames(mrna))),]
+rownames(mrna)=removeVersion(rownames(mrna))
+```
+
+
+```{r}
+#biomart
+mart <- useEnsembl("ensembl", dataset = "hsapiens_gene_ensembl")
+ensembl_to_symbol <- getBM(attributes =c('ensembl_gene_id','external_gene_name', 'gene_biotype'),
+                         filters = "ensembl_gene_id",
+                         values = row.names(mrna), 
+                         mart = mart)
+```
+
+
+```{r}
+#remove 
+ensembl_to_symbol <- ensembl_to_symbol[ ensembl_to_symbol$"external_gene_name" != ""&ensembl_to_symbol$gene_biotype == "protein_coding", ]
+
+#exclude from mrna 
+mrna <- merge(x=ensembl_to_symbol, y=mrna, by.x =c("ensembl_gene_id"),by.y=0)
+mrna <- subset(mrna, select = -c(ensembl_gene_id, gene_biotype))
+```
+
+
+
+```{r}
+#Check for duplicates
+sum(duplicated(mrna$external_gene_name))
+gene_duplicates= as.data.frame(table(mrna$external_gene_name))
+gene_duplicates=gene_duplicates[gene_duplicates$Freq>1,]
+```
+
+
+```{r}
+# Choosing from the duplicate name, the gene with the highest overall expression avg 
+
+for (dup in gene_duplicates$Var1) {
+  
+  # Identify rows with the same gene name
+duplicates_indices = which(mrna[, 1] == dup)
+
+# Calculate row means for each gene (skip the first column as it contains the gene symbols)
+duplicates_means = rowMeans(mrna[duplicates_indices,-1])
+
+
+# Find the row with the minimum mean to remove
+max_mean_duplicate = which.max(duplicates_means)
+
+# remove the row with the lowest mean
+mrna = mrna[-duplicates_indices[-max_mean_duplicate], ]
+
+}
+
+sum(duplicated(mrna$external_gene_name))
+```
+
+
+
+```{r}
+#Save as RDS
+saveRDS(mrna, 'mrna_melanoma_A_only.rds')
+write.table(mrna, file= 'mrna_skin_only.csv', sep = ",",row.names = TRUE)
+write.table(SKCM_clinical, file= 'skin_clinical.csv', sep = ",",row.names = TRUE)
+```
+
+
+```{r}
+#prefilterring the counts
+rownames(mrna) <- mrna$external_gene_name
+mrna <- mrna[,-1]
+mrna<- mrna[rowSums(mrna)>= 10,]
+```
+
+
+```{r}
+mrna <- mrna[,colnames(mrna)%in%SKCM_clinical$case_submitter_id]
+SKCM_clinical <- SKCM_clinical[SKCM_clinical$case_submitter_id%in%colnames(mrna),]
+Low = "Low"
+High = "High"
+
+```
+
+
+```{r}
+#Deseq2 data set 
+dds <- DESeqDataSetFromMatrix(countData = mrna, colData = SKCM_clinical, design = ~ Climate)
+dds <- DESeq(dds)
+dds_results <- results(dds, contrast = c("Climate", High, Low), lfcThreshold = 0)
+dds_results= na.omit(as.data.frame(dds_results))
+sig_degs = dds_results[dds_results$padj < 0.05 & abs(dds_results$log2FoldChange)>= 1,]
+
+
+write.table(sig_degs, "sig_degs_malenoma.csv", sep = "," )
+plotDispEsts(dds)
+DESeq2:: plotMA(dds)
+```
+
+
+```{r}
+#for diffrential methylation analysis
+```
+
+
+```{r}
+methylation <- methylation[,colnames(methylation) %in% colnames(mrna)]
+```
+
+
+```{r}
+data(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+annotations <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+```
+
+
+```{r}
+#get the propes of the promoter regions (transcription start site)
+#remove the sex chromosomes promotors
+promoter_probes <- annotations[annotations$Relation_to_Island == "Island" & grepl("Promoter_Associated",annotations$Regulatory_Feature_Group)&annotations$UCSC_RefGene_Name != ""& annotations$chr!=c("chrX")&annotations$chr!=c("chrY"),]
+promoter_probes <- as.data.frame(promoter_probes)
+
+
+gene_names <- promoter_probes[, c("Name", "UCSC_RefGene_Name")]
+```
+
+
+```{r}
+# Extract methylation data for promoter regions
+methylation <- methylation[rownames(methylation) %in% rownames(promoter_probes),]
+
+
+```
+
+
+```{r}
+gene_names <- promoter_probes[, c("Name", "UCSC_RefGene_Name")]
+gene_names <- as.data.frame(gene_names)
+unique_gene_names <- sapply(gene_names$UCSC_RefGene_Name, function(x) {
+  unique_genes <- unique(unlist(strsplit(x, ";")))
+  paste(unique_genes, collapse = ";")
+})
+```
+
+
+```{r}
+# Convert Climate variable to a factor
+climate <- factor(SKCM_clinical$Climate)
+
+# Create the design matrix using the correct variable name
+design <- model.matrix(~ climate, data = SKCM_clinical)
+
+# Check the design matrix to understand the column names
+print(design)
+
+# Assign appropriate column names if necessary
+colnames(design) <- make.names(colnames(design))
+
+# Check column names to ensure they match your contrast definition
+print(colnames(design))
+
+
+# Fit the linear model
+fit <- lmFit(methylation, design)
+
+# Apply empirical Bayes moderation
+fit <- eBayes(fit)
+
+# Set digits option for display
+options(digits = 2)
+
+# Get the top table of results without adjustment for multiple testing
+res <- topTable(fit, number = Inf, adjust.method = "none", coef = 2)
+contMatrix <- makeContrasts(contrasts = "High"-"Low", levels = design)
+
+# Fit contrasts for the linear model
+fit2 <- contrasts.fit(fit, contMatrix)
+
+# Apply empirical Bayes moderation again
+fit2 <- eBayes(fit2)
+
+# Summarize results of differential expression tests
+summary(decideTests(fit2))
+
+# Get the table of results for the first contrast
+ann450kSub <- promoter_probes[match(rownames(methylation), promoter_probes$Name), c(1:4, 12:19, 24:ncol(promoter_probes))]
+DMPs <- topTable(fit2, number = Inf, coef = 1, genelist = ann450kSub)
+
+# Display the head of the results table
+head(DMPs)
+
+
+```
+
+
